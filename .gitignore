@@ -1,0 +1,8 @@
+# Generated on the server by install.php — never commit
+app/config.php
+# Runtime data
+storage/*
+!storage/.htaccess
+!storage/index.html
+.DS_Store
+Thumbs.db
