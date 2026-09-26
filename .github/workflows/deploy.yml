@@ -1,0 +1,60 @@
+# Deploys MailPilot to marketing.dauddev.com (Spaceship cPanel) over FTPS.
+#
+# Required repository secrets (GitHub → Settings → Secrets and variables → Actions):
+#   FTP_SERVER    e.g. server44.shared.spaceship.host
+#   FTP_USERNAME  the cPanel FTP account whose home folder is the subdomain folder
+#   FTP_PASSWORD  that FTP account's password
+#
+# Only changed files are uploaded. The server's own files are never uploaded over or
+# deleted: app/config.php (database + secret keys), storage/ (sessions, logs) and install.php.
+name: Deploy to marketing.dauddev.com
+
+on:
+  push:
+    branches:
+      - main
+      - claude/dreamy-pascal-5h38pp
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+
+      - name: PHP syntax check
+        run: |
+          set -e
+          for f in $(git ls-files '*.php'); do php -l "$f" > /dev/null; done
+          echo "All PHP files OK"
+
+      - name: Upload changed files over FTPS
+        uses: SamKirkland/FTP-Deploy-Action@v4.3.5
+        with:
+          server: ${{ secrets.FTP_SERVER }}
+          username: ${{ secrets.FTP_USERNAME }}
+          password: ${{ secrets.FTP_PASSWORD }}
+          protocol: ftps
+          port: 21
+          server-dir: ./
+          exclude: |
+            **/.git*
+            **/.git*/**
+            .github/**
+            README.md
+            install.php
+            app/config.php
+            storage/**
+
+      - name: Check the site responds
+        run: |
+          sleep 5
+          code=$(curl -s -o /dev/null -w "%{http_code}" https://marketing.dauddev.com/)
+          echo "https://marketing.dauddev.com/ answered HTTP $code"
+          test "$code" = "200"
