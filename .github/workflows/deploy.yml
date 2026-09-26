@@ -1,12 +1,13 @@
-# Deploys MailPilot to marketing.dauddev.com (Spaceship cPanel) over FTPS.
+# Deploys MailPilot to marketing.dauddev.com (Spaceship cPanel) over encrypted FTP (FTPS).
 #
 # Required repository secrets (GitHub → Settings → Secrets and variables → Actions):
 #   FTP_SERVER    e.g. server44.shared.spaceship.host
 #   FTP_USERNAME  the cPanel FTP account whose home folder is the subdomain folder
 #   FTP_PASSWORD  that FTP account's password
 #
-# Only changed files are uploaded. The server's own files are never uploaded over or
-# deleted: app/config.php (database + secret keys), storage/ (sessions, logs) and install.php.
+# Only files changed since the last deployment are uploaded (the deployed commit is kept
+# in .deploy-rev on the server). These server files are never uploaded over or deleted:
+# app/config.php (database + secret keys), storage/ (sessions, logs) and install.php.
 name: Deploy to marketing.dauddev.com
 
 on:
@@ -15,6 +16,11 @@ on:
       - main
       - claude/dreamy-pascal-5h38pp
   workflow_dispatch:
+    inputs:
+      full:
+        description: "Upload every file (ignore what is already deployed)"
+        type: boolean
+        default: false
 
 concurrency:
   group: deploy-production
@@ -27,6 +33,8 @@ jobs:
     steps:
       - name: Check out code
         uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
 
       - name: PHP syntax check
         run: |
@@ -34,53 +42,72 @@ jobs:
           for f in $(git ls-files '*.php'); do php -l "$f" > /dev/null; done
           echo "All PHP files OK"
 
-      - name: Diagnose FTP connection
-        continue-on-error: true
+      - name: Upload changed files over FTPS
         env:
           FTP_SERVER: ${{ secrets.FTP_SERVER }}
           FTP_USERNAME: ${{ secrets.FTP_USERNAME }}
           FTP_PASSWORD: ${{ secrets.FTP_PASSWORD }}
+          FULL: ${{ inputs.full }}
         run: |
-          echo "Runner public IP: $(curl -s https://api.ipify.org)"
-          echo "::group::DNS"
-          getent hosts "$FTP_SERVER" || echo "Cannot resolve $FTP_SERVER"
-          echo "::endgroup::"
-          for port in 21 990; do
-            if timeout 10 bash -c "echo > /dev/tcp/$FTP_SERVER/$port" 2>/dev/null; then echo "Port $port: OPEN"; else echo "Port $port: CLOSED/FILTERED"; fi
-          done
-          echo "::group::Explicit FTPS (port 21, AUTH TLS)"
-          curl -sS -v --max-time 30 --ssl-reqd --list-only --user "$FTP_USERNAME:$FTP_PASSWORD" "ftp://$FTP_SERVER:21/" 2>&1 | grep -v '^\* \(TLS\|ALPN\)' | tail -40 && echo "RESULT: explicit FTPS works" || echo "RESULT: explicit FTPS failed"
-          echo "::endgroup::"
-          echo "::group::Implicit FTPS (port 990)"
-          curl -sS -v --max-time 30 --list-only --user "$FTP_USERNAME:$FTP_PASSWORD" "ftps://$FTP_SERVER:990/" 2>&1 | tail -25 && echo "RESULT: implicit FTPS works" || echo "RESULT: implicit FTPS failed"
-          echo "::endgroup::"
-          echo "::group::Plain FTP (port 21)"
-          curl -sS -v --max-time 30 --list-only --user "$FTP_USERNAME:$FTP_PASSWORD" "ftp://$FTP_SERVER:21/" 2>&1 | tail -25 && echo "RESULT: plain FTP works" || echo "RESULT: plain FTP failed"
-          echo "::endgroup::"
+          set -uo pipefail
+          BASE="ftp://$FTP_SERVER"
+          ftp() { curl -sS --ssl-reqd --retry 3 --retry-delay 2 --connect-timeout 20 --max-time 120 --user "$FTP_USERNAME:$FTP_PASSWORD" "$@"; }
 
-      - name: Upload changed files over FTPS
-        uses: SamKirkland/FTP-Deploy-Action@v4.3.5
-        with:
-          server: ${{ secrets.FTP_SERVER }}
-          username: ${{ secrets.FTP_USERNAME }}
-          password: ${{ secrets.FTP_PASSWORD }}
-          protocol: ${{ vars.FTP_PROTOCOL || 'ftps' }}
-          port: ${{ vars.FTP_PORT || 21 }}
-          security: loose
-          timeout: 60000
-          server-dir: ./
-          exclude: |
-            **/.git*
-            **/.git*/**
-            .github/**
-            README.md
-            install.php
-            app/config.php
-            storage/**
+          # Paths that must never be touched on the server.
+          skip() {
+            case "$1" in
+              .github/*|.gitignore|README.md|install.php|app/config.php|storage/*) return 0 ;;
+            esac
+            return 1
+          }
+
+          PREV=""
+          if [ "${FULL:-false}" != "true" ]; then
+            PREV=$(ftp "$BASE/.deploy-rev" 2>/dev/null | tr -dc '0-9a-f' || true)
+          fi
+          HEAD=$(git rev-parse HEAD)
+
+          : > upload.txt
+          : > delete.txt
+          if [ -n "$PREV" ] && git cat-file -e "$PREV^{commit}" 2>/dev/null; then
+            echo "Last deployed commit: $PREV → deploying changes up to $HEAD"
+            git diff --name-status --no-renames "$PREV" "$HEAD" | while IFS=$'\t' read -r status path; do
+              if [ "$status" = "D" ]; then echo "$path" >> delete.txt; else echo "$path" >> upload.txt; fi
+            done
+          else
+            echo "Full deployment of $HEAD"
+            git ls-files > upload.txt
+          fi
+
+          failed=0; uploaded=0; deleted=0
+          while IFS= read -r f; do
+            [ -z "$f" ] && continue
+            skip "$f" && continue
+            [ -f "$f" ] || continue
+            if ftp --ftp-create-dirs -T "$f" "$BASE/$f"; then
+              echo "⬆ $f"; uploaded=$((uploaded+1))
+            else
+              echo "::error::Upload failed: $f"; failed=1
+            fi
+          done < upload.txt
+
+          while IFS= read -r f; do
+            [ -z "$f" ] && continue
+            skip "$f" && continue
+            if ftp -o /dev/null -Q "DELE $f" "$BASE/" 2>/dev/null; then echo "🗑 $f"; deleted=$((deleted+1)); fi
+          done < delete.txt
+
+          if [ "$failed" -ne 0 ]; then
+            echo "Some files failed to upload — not recording this deployment so the next run retries them."
+            exit 1
+          fi
+          echo "$HEAD" > .deploy-rev
+          ftp -T .deploy-rev "$BASE/.deploy-rev"
+          echo "✅ Deployed $HEAD — $uploaded uploaded, $deleted deleted"
 
       - name: Check the site responds
         run: |
-          sleep 5
+          sleep 3
           code=$(curl -s -o /dev/null -w "%{http_code}" https://marketing.dauddev.com/)
           echo "https://marketing.dauddev.com/ answered HTTP $code"
           test "$code" = "200"
