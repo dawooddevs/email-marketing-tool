@@ -26,7 +26,7 @@ jobs:
     timeout-minutes: 20
     steps:
       - name: Check out code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: PHP syntax check
         run: |
@@ -34,14 +34,40 @@ jobs:
           for f in $(git ls-files '*.php'); do php -l "$f" > /dev/null; done
           echo "All PHP files OK"
 
+      - name: Diagnose FTP connection
+        continue-on-error: true
+        env:
+          FTP_SERVER: ${{ secrets.FTP_SERVER }}
+          FTP_USERNAME: ${{ secrets.FTP_USERNAME }}
+          FTP_PASSWORD: ${{ secrets.FTP_PASSWORD }}
+        run: |
+          echo "Runner public IP: $(curl -s https://api.ipify.org)"
+          echo "::group::DNS"
+          getent hosts "$FTP_SERVER" || echo "Cannot resolve $FTP_SERVER"
+          echo "::endgroup::"
+          for port in 21 990; do
+            if timeout 10 bash -c "echo > /dev/tcp/$FTP_SERVER/$port" 2>/dev/null; then echo "Port $port: OPEN"; else echo "Port $port: CLOSED/FILTERED"; fi
+          done
+          echo "::group::Explicit FTPS (port 21, AUTH TLS)"
+          curl -sS -v --max-time 30 --ssl-reqd --list-only --user "$FTP_USERNAME:$FTP_PASSWORD" "ftp://$FTP_SERVER:21/" 2>&1 | grep -v '^\* \(TLS\|ALPN\)' | tail -40 && echo "RESULT: explicit FTPS works" || echo "RESULT: explicit FTPS failed"
+          echo "::endgroup::"
+          echo "::group::Implicit FTPS (port 990)"
+          curl -sS -v --max-time 30 --list-only --user "$FTP_USERNAME:$FTP_PASSWORD" "ftps://$FTP_SERVER:990/" 2>&1 | tail -25 && echo "RESULT: implicit FTPS works" || echo "RESULT: implicit FTPS failed"
+          echo "::endgroup::"
+          echo "::group::Plain FTP (port 21)"
+          curl -sS -v --max-time 30 --list-only --user "$FTP_USERNAME:$FTP_PASSWORD" "ftp://$FTP_SERVER:21/" 2>&1 | tail -25 && echo "RESULT: plain FTP works" || echo "RESULT: plain FTP failed"
+          echo "::endgroup::"
+
       - name: Upload changed files over FTPS
         uses: SamKirkland/FTP-Deploy-Action@v4.3.5
         with:
           server: ${{ secrets.FTP_SERVER }}
           username: ${{ secrets.FTP_USERNAME }}
           password: ${{ secrets.FTP_PASSWORD }}
-          protocol: ftps
-          port: 21
+          protocol: ${{ vars.FTP_PROTOCOL || 'ftps' }}
+          port: ${{ vars.FTP_PORT || 21 }}
+          security: loose
+          timeout: 60000
           server-dir: ./
           exclude: |
             **/.git*
